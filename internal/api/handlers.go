@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/abdi27s/attend-sync/internal/attendance"
+	"github.com/abdi27s/attend-sync/internal/device"
 	"github.com/abdi27s/attend-sync/internal/device/types"
 )
 
@@ -43,7 +44,7 @@ func (h *Handler) Attendance(
 		return
 	}
 
-	if err := validateAttendanceRequest(req); err != nil {
+	if err := validateAttendanceRequest(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -92,6 +93,185 @@ func (h *Handler) Attendance(
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (h *Handler) TestDevice(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Success: false,
+			Error:   "method not allowed",
+		})
+		return
+	}
+
+	var req DeviceTestRequest
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   "invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	if err := validateDeviceRequest(req.Device); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	config := types.DeviceConfig{
+		ID:       req.Device.ID,
+		Name:     req.Device.Name,
+		Type:     req.Device.Type,
+		Host:     req.Device.Host,
+		Port:     req.Device.Port,
+		Username: req.Device.Username,
+		Password: req.Device.Password,
+		Enabled:  true,
+	}
+
+	attendanceDevice, err := device.New(config)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	if err := attendanceDevice.Connect(); err != nil {
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "failed to connect to device: " + err.Error(),
+		})
+		return
+	}
+
+	defer func() {
+		_ = attendanceDevice.Disconnect()
+	}()
+
+	if err := attendanceDevice.TestConnection(); err != nil {
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "device connection test failed: " + err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DeviceTestResponse{
+		Success:   true,
+		Connected: true,
+		Device: DeviceResponse{
+			ID:   req.Device.ID,
+			Name: req.Device.Name,
+			Type: req.Device.Type,
+			Host: req.Device.Host,
+			Port: req.Device.Port,
+		},
+	})
+}
+
+func (h *Handler) DeviceInfo(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Success: false,
+			Error:   "method not allowed",
+		})
+		return
+	}
+
+	var req DeviceTestRequest
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   "invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	if err := validateDeviceRequest(req.Device); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	config := types.DeviceConfig{
+		ID:       req.Device.ID,
+		Name:     req.Device.Name,
+		Type:     req.Device.Type,
+		Host:     req.Device.Host,
+		Port:     req.Device.Port,
+		Username: req.Device.Username,
+		Password: req.Device.Password,
+		Enabled:  true,
+	}
+
+	attendanceDevice, err := device.New(config)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	if err := attendanceDevice.Connect(); err != nil {
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "failed to connect to device: " + err.Error(),
+		})
+		return
+	}
+
+	defer func() {
+		_ = attendanceDevice.Disconnect()
+	}()
+
+	info, err := attendanceDevice.GetDeviceInfo()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "failed to get device info: " + err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DeviceInfoResponse{
+		Success: true,
+		Device: DeviceResponse{
+			ID:   req.Device.ID,
+			Name: req.Device.Name,
+			Type: req.Device.Type,
+			Host: req.Device.Host,
+			Port: req.Device.Port,
+		},
+		Info: DeviceInfoData{
+			ID:       info.ID,
+			Name:     info.Name,
+			Type:     info.Type,
+			Firmware: info.Firmware,
+			Serial:   info.Serial,
+		},
+	})
+}
+
 func (h *Handler) Health(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -110,33 +290,35 @@ func (h *Handler) Health(
 	})
 }
 
-func validateAttendanceRequest(req AttendanceRequest) error {
-	if req.Device.ID == "" {
+func validateAttendanceRequest(req *AttendanceRequest) error {
+	if err := validateDeviceRequest(req.Device); err != nil {
+		return err
+	}
+
+	if req.From != nil && req.To != nil {
+		if !req.From.Before(*req.To) {
+			return errorString("from must be before to")
+		}
+	}
+
+	return nil
+}
+
+func validateDeviceRequest(req DeviceRequest) error {
+	if req.ID == "" {
 		return errorString("device.id is required")
 	}
 
-	if req.Device.Type == "" {
+	if req.Type == "" {
 		return errorString("device.type is required")
 	}
 
-	if req.Device.Host == "" {
+	if req.Host == "" {
 		return errorString("device.host is required")
 	}
 
-	if req.Device.Port < 1 || req.Device.Port > 65535 {
+	if req.Port < 1 || req.Port > 65535 {
 		return errorString("device.port must be between 1 and 65535")
-	}
-
-	if req.From.IsZero() {
-		return errorString("from is required")
-	}
-
-	if req.To.IsZero() {
-		return errorString("to is required")
-	}
-
-	if !req.From.Before(req.To) {
-		return errorString("from must be before to")
 	}
 
 	return nil

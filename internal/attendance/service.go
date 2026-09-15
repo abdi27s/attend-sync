@@ -15,11 +15,11 @@ func NewService() *Service {
 
 func (s *Service) FetchLogs(
 	config types.DeviceConfig,
-	from time.Time,
-	to time.Time,
+	from *time.Time,
+	to *time.Time,
 ) ([]AttendanceLog, error) {
 
-	attendanceDevice, err := device.NewDevice(config)
+	attendanceDevice, err := device.New(config)
 	if err != nil {
 		return nil, err
 	}
