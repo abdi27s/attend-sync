@@ -18,7 +18,13 @@ FROM alpine:3.22
 
 WORKDIR /app
 
+# Certificates are handy for future HTTPS webhooks; tzdata keeps
+# device timestamps rendering in the right zone.
+RUN apk add --no-cache ca-certificates tzdata
+
 COPY --from=builder /app/attend-sync .
+
+ENV PORT=8080
 
 EXPOSE 8080
 

@@ -1,6 +1,7 @@
 package attendance
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/abdi27s/attend-sync/internal/device"
@@ -18,6 +19,9 @@ func (s *Service) FetchLogs(
 	from *time.Time,
 	to *time.Time,
 ) ([]AttendanceLog, error) {
+	if config.Host == "" {
+		return nil, fmt.Errorf("device host is required")
+	}
 
 	attendanceDevice, err := device.New(config)
 	if err != nil {
@@ -25,7 +29,7 @@ func (s *Service) FetchLogs(
 	}
 
 	if err := attendanceDevice.Connect(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("device %q (%s): %w", config.ID, config.Host, err)
 	}
 
 	defer func() {
@@ -36,9 +40,8 @@ func (s *Service) FetchLogs(
 		from,
 		to,
 	)
-
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("device %q: %w", config.ID, err)
 	}
 
 	logs := make([]AttendanceLog, 0, len(records))

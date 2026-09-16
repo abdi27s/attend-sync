@@ -2,11 +2,20 @@ package zkteco
 
 import (
 	"fmt"
+	"log"
+	"net"
 	"time"
 
 	zklib "github.com/farizfadian/go-zkteco"
 
 	"github.com/abdi27s/attend-sync/internal/device/types"
+)
+
+// Defaults for ZKTeco TCP connections.
+const (
+	defaultTimeout = 10 * time.Second
+	defaultRetries = 3
+	retryDelay     = time.Second
 )
 
 type Device struct {
@@ -20,34 +29,64 @@ func New(config types.DeviceConfig) *Device {
 	}
 }
 
+// address returns "host:port", falling back to 4370 when Port is unset.
+// The underlying library accepts both "host" and "host:port", but we
+// always build an explicit host:port so behaviour is predictable.
+// net.JoinHostPort also handles IPv6 correctly.
+func (d *Device) address() string {
+	return net.JoinHostPort(
+		d.config.Host,
+		fmt.Sprintf("%d", d.config.NormalizedPort()),
+	)
+}
+
 func (d *Device) Connect() error {
 	if d.config.Host == "" {
 		return fmt.Errorf("device host is required")
 	}
 
-	if d.config.Port < 1 || d.config.Port > 65535 {
-		return fmt.Errorf("invalid device port: %d", d.config.Port)
+	if d.client != nil && d.client.IsConnected() {
+		return nil
 	}
 
-	address := fmt.Sprintf("%s:%d", d.config.Host, d.config.Port)
+	// Always disconnect a stale handle before dialling again.
+	if d.client != nil {
+		_ = d.client.Disconnect()
+		d.client = nil
+	}
+
+	address := d.address()
 
 	options := []zklib.Option{
-		zklib.WithTimeout(5 * time.Second),
-		zklib.WithRetry(2, 500*time.Millisecond),
+		zklib.WithTimeout(defaultTimeout),
+		zklib.WithRetry(defaultRetries, retryDelay),
 	}
 
-	if d.config.Password != "" {
+	// Most ZKTeco devices ship with comm key "0" (= no password).
+	// The library treats "" as no key, so only send a key when set
+	// and not "0".
+	if d.config.Password != "" && d.config.Password != "0" {
 		options = append(options, zklib.WithPassword(d.config.Password))
 	}
 
-	client, err := zklib.Connect(address, options...)
-	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", address, err)
+	var lastErr error
+	for attempt := 1; attempt <= defaultRetries; attempt++ {
+		client, err := zklib.Connect(address, options...)
+		if err == nil {
+			d.client = client
+			return nil
+		}
+		lastErr = err
+		log.Printf(
+			"[zkteco] connect attempt %d/%d to %s failed: %v",
+			attempt, defaultRetries, address, err,
+		)
+		if attempt < defaultRetries {
+			time.Sleep(retryDelay)
+		}
 	}
 
-	d.client = client
-
-	return nil
+	return fmt.Errorf("failed to connect to %s: %w", address, lastErr)
 }
 
 func (d *Device) Disconnect() error {
@@ -87,9 +126,14 @@ func (d *Device) GetDeviceInfo() (types.DeviceInfo, error) {
 		return types.DeviceInfo{}, fmt.Errorf("failed to get device info: %w", err)
 	}
 
+	name := info.DeviceName
+	if name == "" {
+		name = d.config.Name
+	}
+
 	return types.DeviceInfo{
 		ID:       d.config.ID,
-		Name:     info.DeviceName,
+		Name:     name,
 		Type:     d.config.Type,
 		Firmware: info.FirmwareVersion,
 		Serial:   info.SerialNumber,
@@ -104,38 +148,31 @@ func (d *Device) GetAttendanceLogs(
 		return nil, err
 	}
 
-	var (
-		logs []zklib.AttendanceLog
-		err  error
-	)
-
-	if from == nil {
-		logs, err = d.client.GetAttendance()
-	} else {
-		logs, err = d.client.GetAttendanceSince(*from)
-	}
-
+	// NOTE: GetAttendanceSince() only filters client-side *after*
+	// downloading everything, so always fetch all logs once and
+	// apply both from/to filters here (inclusive range).
+	logs, err := d.client.GetAttendance()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get attendance logs: %w", err)
 	}
 
 	records := make([]types.AttendanceRecord, 0, len(logs))
 
-	for _, log := range logs {
-		if from != nil && log.Time.Before(*from) {
+	for _, l := range logs {
+		if from != nil && l.Time.Before(*from) {
 			continue
 		}
 
-		if to != nil && log.Time.After(*to) {
+		if to != nil && l.Time.After(*to) {
 			continue
 		}
 
 		records = append(records, types.AttendanceRecord{
-			UserID:     fmt.Sprintf("%d", log.UserID),
-			Timestamp:  log.Time,
-			Status:     log.StateString(),
-			VerifyType: log.VerifyTypeString(),
-			WorkCode:   fmt.Sprintf("%d", log.WorkCode),
+			UserID:     fmt.Sprintf("%d", l.UserID),
+			Timestamp:  l.Time,
+			Status:     l.StateString(),
+			VerifyType: l.VerifyTypeString(),
+			WorkCode:   fmt.Sprintf("%d", l.WorkCode),
 		})
 	}
 

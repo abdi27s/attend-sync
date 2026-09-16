@@ -37,8 +37,8 @@ func (d *Device) GetDeviceInfo() (types.DeviceInfo, error) {
 }
 
 func (d *Device) GetAttendanceLogs(
-	from time.Time,
-	to time.Time,
+	from *time.Time,
+	to *time.Time,
 ) ([]types.AttendanceRecord, error) {
 	return nil, nil
 }

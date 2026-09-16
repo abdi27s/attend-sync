@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/abdi27s/attend-sync/internal/attendance"
 	"github.com/abdi27s/attend-sync/internal/device"
@@ -52,29 +55,46 @@ func (h *Handler) Attendance(
 		return
 	}
 
-	config := types.DeviceConfig{
-		ID:       req.Device.ID,
-		Name:     req.Device.Name,
-		Type:     req.Device.Type,
-		Host:     req.Device.Host,
-		Port:     req.Device.Port,
-		Username: req.Device.Username,
-		Password: req.Device.Password,
-		Enabled:  true,
+	config := toDeviceConfig(req.Device)
+
+	// Bound the whole device round-trip so a dead device can't hold
+	// the HTTP worker forever (server WriteTimeout is 2m; keep shorter).
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+
+	type result struct {
+		logs []attendance.AttendanceLog
+		err  error
 	}
+	ch := make(chan result, 1)
+	go func() {
+		l, err := h.attendanceService.FetchLogs(config, req.From, req.To)
+		ch <- result{logs: l, err: err}
+	}()
 
-	logs, err := h.attendanceService.FetchLogs(
-		config,
-		req.From,
-		req.To,
-	)
-
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+	var logs []attendance.AttendanceLog
+	select {
+	case <-ctx.Done():
+		log.Printf("[api] attendance fetch for device %q timed out: %v", config.ID, ctx.Err())
+		writeJSON(w, http.StatusGatewayTimeout, ErrorResponse{
 			Success: false,
-			Error:   "failed to retrieve attendance logs: " + err.Error(),
+			Error:   "device request timed out",
 		})
 		return
+	case res := <-ch:
+		if res.err != nil {
+			log.Printf("[api] attendance fetch failed device=%q host=%s: %v", config.ID, config.Host, res.err)
+			writeJSON(w, http.StatusBadGateway, ErrorResponse{
+				Success: false,
+				Error:   "failed to retrieve attendance logs: " + res.err.Error(),
+			})
+			return
+		}
+		logs = res.logs
+	}
+
+	if logs == nil {
+		logs = []attendance.AttendanceLog{}
 	}
 
 	response := AttendanceResponse{
@@ -84,7 +104,7 @@ func (h *Handler) Attendance(
 			Name: req.Device.Name,
 			Type: req.Device.Type,
 			Host: req.Device.Host,
-			Port: req.Device.Port,
+			Port: config.NormalizedPort(),
 		},
 		Count:   len(logs),
 		Records: logs,
@@ -126,16 +146,7 @@ func (h *Handler) TestDevice(
 		return
 	}
 
-	config := types.DeviceConfig{
-		ID:       req.Device.ID,
-		Name:     req.Device.Name,
-		Type:     req.Device.Type,
-		Host:     req.Device.Host,
-		Port:     req.Device.Port,
-		Username: req.Device.Username,
-		Password: req.Device.Password,
-		Enabled:  true,
-	}
+	config := toDeviceConfig(req.Device)
 
 	attendanceDevice, err := device.New(config)
 	if err != nil {
@@ -147,6 +158,7 @@ func (h *Handler) TestDevice(
 	}
 
 	if err := attendanceDevice.Connect(); err != nil {
+		log.Printf("[api] test connect failed device=%q host=%s: %v", config.ID, config.Host, err)
 		writeJSON(w, http.StatusBadGateway, ErrorResponse{
 			Success: false,
 			Error:   "failed to connect to device: " + err.Error(),
@@ -174,7 +186,7 @@ func (h *Handler) TestDevice(
 			Name: req.Device.Name,
 			Type: req.Device.Type,
 			Host: req.Device.Host,
-			Port: req.Device.Port,
+			Port: config.NormalizedPort(),
 		},
 	})
 }
@@ -212,16 +224,7 @@ func (h *Handler) DeviceInfo(
 		return
 	}
 
-	config := types.DeviceConfig{
-		ID:       req.Device.ID,
-		Name:     req.Device.Name,
-		Type:     req.Device.Type,
-		Host:     req.Device.Host,
-		Port:     req.Device.Port,
-		Username: req.Device.Username,
-		Password: req.Device.Password,
-		Enabled:  true,
-	}
+	config := toDeviceConfig(req.Device)
 
 	attendanceDevice, err := device.New(config)
 	if err != nil {
@@ -260,7 +263,7 @@ func (h *Handler) DeviceInfo(
 			Name: req.Device.Name,
 			Type: req.Device.Type,
 			Host: req.Device.Host,
-			Port: req.Device.Port,
+			Port: config.NormalizedPort(),
 		},
 		Info: DeviceInfoData{
 			ID:       info.ID,
@@ -290,6 +293,19 @@ func (h *Handler) Health(
 	})
 }
 
+func toDeviceConfig(req DeviceRequest) types.DeviceConfig {
+	return types.DeviceConfig{
+		ID:       req.ID,
+		Name:     req.Name,
+		Type:     req.Type,
+		Host:     req.Host,
+		Port:     req.Port,
+		Username: req.Username,
+		Password: req.Password,
+		Enabled:  true,
+	}
+}
+
 func validateAttendanceRequest(req *AttendanceRequest) error {
 	if err := validateDeviceRequest(req.Device); err != nil {
 		return err
@@ -317,8 +333,10 @@ func validateDeviceRequest(req DeviceRequest) error {
 		return errorString("device.host is required")
 	}
 
-	if req.Port < 1 || req.Port > 65535 {
-		return errorString("device.port must be between 1 and 65535")
+	// Port 0/omitted means "use device default" (4370 for ZKTeco).
+	// Only reject out-of-range values.
+	if req.Port < 0 || req.Port > 65535 {
+		return errorString("device.port must be between 0 and 65535 (0 = default 4370)")
 	}
 
 	return nil

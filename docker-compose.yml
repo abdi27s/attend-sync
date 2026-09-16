@@ -1,12 +1,18 @@
 services:
   attend-sync:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
+    build: .
     container_name: attend-sync
-
     ports:
       - "8080:8080"
-
+    environment:
+      - PORT=8080
+      # ZKTeco default TCP port. The device IP itself comes per-request
+      # in the JSON body (device.host), so no device env is needed here.
+      # On macOS/Windows Docker Desktop the container cannot reach the
+      # host LAN via `network_mode: host`. If your device is on the same
+      # LAN as your laptop, point device.host at the device LAN IP
+      # (e.g. 192.168.1.201) — bridge networking routes it fine.
+      # If you must reach something listening on the Docker *host*,
+      # use `host.docker.internal` as device.host.
     restart: unless-stopped
+

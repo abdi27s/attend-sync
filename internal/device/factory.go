@@ -9,11 +9,15 @@ import (
 )
 
 func New(config types.DeviceConfig) (Device, error) {
-	switch strings.ToLower(config.Type) {
+	if config.Host == "" {
+		return nil, fmt.Errorf("device host is required")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(config.Type)) {
 	case "zkteco":
 		return zkteco.New(config), nil
 
 	default:
-		return nil, fmt.Errorf("unsupported device type: %s", config.Type)
+		return nil, fmt.Errorf("unsupported device type: %q (supported: zkteco)", config.Type)
 	}
 }
