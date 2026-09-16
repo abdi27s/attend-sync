@@ -1,0 +1,12 @@
+services:
+  attend-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: attend-sync
+
+    ports:
+      - "8080:8080"
+
+    restart: unless-stopped
