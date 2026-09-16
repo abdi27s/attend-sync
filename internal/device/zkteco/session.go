@@ -163,9 +163,21 @@ func (s *rawSession) close() {
 	s.connected = false
 }
 
-// readChunked fetches bulk data via PREPARE_DATA/DATA (pyzk read_with_buffer
-// equivalent): send cmd, then loop CMD_DATA until size bytes collected.
+// readChunked fetches bulk attendance/user data the pyzk way:
+//
+//	get_attendance -> read_with_buffer(CMD_ATTLOG_RRQ):
+//	  send 1503 + pack('<bhii', 1, cmd, fct, ext)
+//	  device answers CMD_DATA (small) or PREPARE_DATA (large, chunked via 1504)
+//
+// Newer ZK8 TCP devices (which is what you have, given the old code got
+// *something*) answer the buffered protocol, NOT plain CMD 13. The old
+// plain-13 path is kept as fallback.
 func (s *rawSession) readChunked(cmd uint16, payload []byte) ([]byte, error) {
+	if blob, err := s.readBuffered(cmd, 0); err == nil && len(blob) > 0 {
+		return blob, nil
+	}
+	// Fall through to legacy plain-command path (old firmware).
+
 	resp, err := s.exchange(cmd, payload, 1032)
 	if err != nil {
 		return nil, err
@@ -181,12 +193,10 @@ func (s *rawSession) readChunked(cmd uint16, payload []byte) ([]byte, error) {
 		return nil, nil
 	}
 	out := make([]byte, 0, size)
-	// First response may already carry data beyond the size prefix.
 	if len(resp.data) > 4 {
 		out = append(out, resp.data[4:]...)
 	}
-	for len(out) < size-0 {
-		// pyzk requests CMD_DATA chunks until total collected.
+	for len(out) < size {
 		r, err := s.exchange(cmdData, nil, 1032)
 		if err != nil {
 			return nil, fmt.Errorf("data chunk: %w", err)
@@ -199,11 +209,78 @@ func (s *rawSession) readChunked(cmd uint16, payload []byte) ([]byte, error) {
 			break
 		}
 	}
-	// Free device buffer (best effort).
 	_, _ = s.exchange(cmdFreeData, nil, 8)
 	if len(out) > size {
 		out = out[:size]
 	}
+	return out, nil
+}
+
+// readBuffered implements pyzk read_with_buffer over TCP:
+// 1503 + struct('<bhii', 1, cmd, fct, ext), then either a single CMD_DATA
+// reply or size-prefixed chunk reads via 1504 + struct('<ii', start, size).
+func (s *rawSession) readBuffered(cmd uint16, fct int32) ([]byte, error) {
+	const (
+		cmdPrepareBuffer uint16 = 1503
+		cmdReadBuffer    uint16 = 1504
+		maxChunk                = 0xFFc0
+	)
+
+	// pyzk pack('<bhii', 1, cmd, fct, ext): signed char, then LE
+	// int16/int32/int32 with one alignment pad after the char = 12 bytes.
+	req := make([]byte, 12)
+	req[0] = 1
+	req[1] = 0 // struct alignment pad
+	binary.LittleEndian.PutUint16(req[2:4], cmd)
+	binary.LittleEndian.PutUint32(req[4:8], uint32(fct))
+	binary.LittleEndian.PutUint32(req[8:12], 0) // ext
+
+	resp, err := s.exchange(cmdPrepareBuffer, req, 2048)
+	if err != nil {
+		return nil, err
+	}
+	if resp.cmd == cmdData {
+		// Small dataset answered inline.
+		return resp.data, nil
+	}
+	if resp.cmd != cmdAckOK && resp.cmd != cmdAckData && resp.cmd != cmdPrepareData {
+		return nil, fmt.Errorf("buffered cmd %d rejected: code %d", cmd, resp.cmd)
+	}
+	if len(resp.data) < 5 {
+		return nil, fmt.Errorf("buffered cmd %d: short size header", cmd)
+	}
+	// pyzk: size = unpack('I', self.__data[1:5])
+	size := int(binary.LittleEndian.Uint32(resp.data[1:5]))
+	if size <= 0 {
+		return nil, nil
+	}
+	out := make([]byte, 0, size)
+	start := 0
+	for start < size {
+		n := size - start
+		if n > maxChunk {
+			n = maxChunk
+		}
+		chunkReq := make([]byte, 8)
+		binary.LittleEndian.PutUint32(chunkReq[0:4], uint32(start))
+		binary.LittleEndian.PutUint32(chunkReq[4:8], uint32(n))
+		r, err := s.exchange(cmdReadBuffer, chunkReq, n+64)
+		if err != nil {
+			return nil, fmt.Errorf("read chunk %d:%d: %w", start, n, err)
+		}
+		if r.cmd != cmdData && r.cmd != cmdAckData && r.cmd != cmdAckOK {
+			return nil, fmt.Errorf("read chunk %d rejected: code %d", start, r.cmd)
+		}
+		if len(r.data) == 0 {
+			break
+		}
+		out = append(out, r.data...)
+		start += len(r.data)
+		if len(r.data) < n {
+			break
+		}
+	}
+	_, _ = s.exchange(cmdFreeData, nil, 8)
 	return out, nil
 }
 

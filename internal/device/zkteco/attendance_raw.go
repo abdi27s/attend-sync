@@ -4,6 +4,7 @@ package zkteco
 // record parsing for 8/16/40-byte dialects + option string reads.
 
 import (
+	"encoding/binary"
 	"time"
 )
 
@@ -33,16 +34,25 @@ type rawLog struct {
 }
 
 func parseLogs(blob []byte) []rawLog {
-	if len(blob) == 0 {
+	if len(blob) <= 4 {
 		return nil
 	}
-	size := detectSize(blob)
+	// pyzk get_attendance: first 4 bytes are total_size (u32 LE),
+	// NOT a record. Strip them before splitting into records.
+	total := int(binary.LittleEndian.Uint32(blob[:4]))
+	body := blob[4:]
+	// Sanity: total should be ~ len(body)+4; tolerate mismatch, use body.
+	_ = total
+	if len(body) == 0 {
+		return nil
+	}
+	size := detectSize(body)
 	if size == 0 {
 		return nil
 	}
 	var out []rawLog
-	for i := 0; i+size <= len(blob); i += size {
-		rec := blob[i : i+size]
+	for i := 0; i+size <= len(body); i += size {
+		rec := body[i : i+size]
 		l, ok := parseRec(rec, size)
 		if ok {
 			out = append(out, l)
