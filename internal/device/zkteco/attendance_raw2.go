@@ -6,16 +6,24 @@ import (
 	"strings"
 )
 
+// The three record dialects ZKTeco devices store attendance in (pyzk
+// get_attendance: 8/16/40 bytes per record).
+const (
+	recordSize8  = 8
+	recordSize16 = 16
+	recordSize40 = 40
+)
+
 func parseRec(rec []byte, size int) (rawLog, bool) {
 	var l rawLog
 	switch size {
-	case 8:
+	case recordSize8:
 		// pyzk: unpack('HB4sB') = uid u16, status u8, time[4], punch u8
 		l.userID = int(binary.LittleEndian.Uint16(rec[0:2]))
 		l.state = int(rec[2])
 		l.when = decodeZKTime(binary.LittleEndian.Uint32(rec[3:7]))
 		l.verify = int(rec[7])
-	case 16:
+	case recordSize16:
 		// pyzk: unpack('<I4sBB2sI') = uid u32, time[4], status, punch,
 		// reserved[2], workcode u32
 		l.userID = int(binary.LittleEndian.Uint32(rec[0:4]))
@@ -23,7 +31,7 @@ func parseRec(rec []byte, size int) (rawLog, bool) {
 		l.state = int(rec[8])
 		l.verify = int(rec[9])
 		l.work = int(binary.LittleEndian.Uint32(rec[12:16]))
-	case 40:
+	case recordSize40:
 		// pyzk: unpack('<H24sB4sB8s') = uid u16, user_id[24] string,
 		// status, time[4], punch, reserved[8]
 		uid := int(binary.LittleEndian.Uint16(rec[0:2]))
@@ -31,15 +39,13 @@ func parseRec(rec []byte, size int) (rawLog, bool) {
 		if i := indexZero(raw); i >= 0 {
 			raw = raw[:i]
 		}
-		s := strings.TrimSpace(string(raw))
-		parsed := 0
-		for i := 0; i < len(s); i++ {
-			if s[i] >= '0' && s[i] <= '9' {
-				parsed = parsed*10 + int(s[i]-'0')
-			}
-		}
-		if parsed != 0 {
-			l.userID = parsed
+		// The user field is a string here (that is the point of the 40-byte
+		// dialect). Accept it only when it really is a number: accumulating
+		// the digits of a mixed value like "12A3" would invent user id 123,
+		// which is exactly the "plausible but wrong" failure mode this
+		// parser is meant to avoid. Otherwise fall back to the numeric uid.
+		if n, ok := digitsOnly(strings.TrimSpace(string(raw))); ok {
+			l.userID = n
 		} else {
 			l.userID = uid
 		}
@@ -49,7 +55,10 @@ func parseRec(rec []byte, size int) (rawLog, bool) {
 	default:
 		return l, false
 	}
-	if l.userID <= 0 || l.when.Year() < 2000 || l.when.Year() > 2100 {
+	// NOTE: no year-range rejection here. The device clock may genuinely
+	// read year 2000 (dead RTC battery / never set) — that is real data
+	// the user must see, not a parse failure. Only reject empty user IDs.
+	if l.userID <= 0 {
 		return l, false
 	}
 	return l, true
@@ -62,6 +71,22 @@ func indexZero(b []byte) int {
 		}
 	}
 	return -1
+}
+
+// digitsOnly parses s as a non-negative decimal integer, reporting false for
+// anything else (empty, mixed alphanumeric, signs, punctuation).
+func digitsOnly(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	return n, true
 }
 
 func stateString(s int) string {

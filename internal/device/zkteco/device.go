@@ -1,6 +1,7 @@
 package zkteco
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -18,8 +19,11 @@ const (
 	defaultTimeout = 10 * time.Second
 	defaultRetries = 2
 	retryDelay     = 2 * time.Second
-	// How long to wait for a bare TCP handshake before sending CMD_CONNECT.
-	tcpDialTimeout = 5 * time.Second
+	// How long to wait for the TCP handshake before sending CMD_CONNECT.
+	// Matches pyzk's 10s socket timeout: ZKTeco units on flaky Wi-Fi/links
+	// can take several seconds to accept a connection, and a 5s cap was
+	// producing spurious "i/o timeout" reports on a healthy device.
+	tcpDialTimeout = 10 * time.Second
 )
 
 type Device struct {
@@ -149,18 +153,39 @@ func parseCommKey(pw string) (int, error) {
 	return n, nil
 }
 
+// probeTag renders the probe context only when it carries information, so
+// error strings never end with a dangling `(probe="")`.
+func (d *Device) probeTag() string {
+	if d.lastProbe == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (probe=%q)", d.lastProbe)
+}
+
 // diagnose maps the handshake error to the most likely device-side cause.
 func (d *Device) diagnose(err error) error {
 	if err == nil {
 		return nil
 	}
 	switch {
+	case isDialTimeout(err):
+		// Nothing was ever exchanged: the TCP SYN itself went unanswered,
+		// which is a reachability problem, NOT a protocol/handshake one.
+		return fmt.Errorf(
+			"%w%s. TCP itself timed out, so no ZKTeco packet was ever exchanged (no framing/comm-key "+
+				"involved). Check, in order: (1) this host and the device are on the same network — "+
+				"app host is on a different subnet, traffic leaves via the default gateway and dies "+
+				"(verify with `ping %s`); (2) device is powered on / its IP unchanged (MENU → COMM. → IP); "+
+				"(3) device allows ONE session, so a stuck session refuses new SYNs — power-cycle, wait ~30s, "+
+				"then make ONE request",
+			err, d.probeTag(), d.config.Host,
+		)
 	case isReset(err):
 		return fmt.Errorf(
-			"%w (probe=%q). "+
+			"%w%s. "+
 				"Device RST the handshake: single-session busy (close ZKBio/other tools, "+
 				"power-cycle, wait 30s, retry ONCE), or comm key / TCP-mode mismatch",
-			err, d.lastProbe,
+			err, d.probeTag(),
 		)
 	case isUnauthErr(err):
 		return fmt.Errorf(
@@ -169,12 +194,22 @@ func (d *Device) diagnose(err error) error {
 		)
 	case isTimeoutErr(err):
 		return fmt.Errorf(
-			"%w (probe=%q). Device stopped answering mid-handshake; power-cycle and retry",
-			err, d.lastProbe,
+			"%w%s. Device stopped answering mid-handshake; power-cycle and retry",
+			err, d.probeTag(),
 		)
 	default:
 		return err
 	}
+}
+
+// isDialTimeout reports whether the failure happened while establishing the
+// TCP connection (as opposed to anywhere inside the ZKTeco exchange).
+func isDialTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "tcp dial") || strings.Contains(msg, "dial tcp")
 }
 
 func isReset(err error) bool {
@@ -331,6 +366,71 @@ func (d *Device) getOption(name string) (string, error) {
 	return parseOption(resp.data), nil
 }
 
+// GetDeviceTime returns the device RTC clock (CMD_GET_TIME, pyzk get_time).
+// Every attendance timestamp is produced by this clock, so this reading is
+// the ground truth for "why do my records say 2000?" — if the device itself
+// reads 2000-01-01, the stored records genuinely say that.
+func (d *Device) GetDeviceTime() (time.Time, error) {
+	if err := d.TestConnection(); err != nil {
+		return time.Time{}, err
+	}
+	resp, err := d.sess.exchange(cmdGetTime, nil, 1032)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("CMD_GET_TIME: %w", err)
+	}
+	switch resp.cmd {
+	case cmdAckUnauth:
+		return time.Time{}, fmt.Errorf("CMD_GET_TIME rejected: unauthenticated — wrong comm key (code 2005)")
+	case cmdAckError:
+		return time.Time{}, fmt.Errorf("CMD_GET_TIME rejected: code %d", resp.cmd)
+	}
+	if len(resp.data) < 4 {
+		return time.Time{}, fmt.Errorf("short CMD_GET_TIME response: %d bytes (need 4)", len(resp.data))
+	}
+	return decodeZKTime(binary.LittleEndian.Uint32(resp.data[:4])), nil
+}
+
+// SetDeviceTime writes the device RTC (CMD_SET_TIME, pyzk set_time) so that
+// punches from now on are stamped with the correct date and time.
+//
+// It does NOT touch already-stored records: a log written while the RTC read
+// 2000 keeps its 2000 timestamp forever, because the device never stored the
+// real instant anywhere. Only new punches benefit.
+func (d *Device) SetDeviceTime(t time.Time) error {
+	if err := d.TestConnection(); err != nil {
+		return err
+	}
+
+	payload := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payload, encodeZKTime(t))
+
+	resp, err := d.sess.exchange(cmdSetTime, payload, 8)
+	if err != nil {
+		return fmt.Errorf("CMD_SET_TIME: %w", err)
+	}
+
+	switch resp.cmd {
+	case cmdAckOK, cmdAckData:
+		return nil
+	case cmdAckUnauth:
+		return fmt.Errorf("CMD_SET_TIME rejected: unauthenticated — wrong comm key (code 2005)")
+	case cmdAckError:
+		return fmt.Errorf(
+			"CMD_SET_TIME rejected by firmware (code 2001): " +
+				"set the clock from the device menu (MENU → System → Date/Time) or via ZKBio",
+		)
+	default:
+		return fmt.Errorf("CMD_SET_TIME rejected: code %d", resp.cmd)
+	}
+}
+
+func headBytes(b []byte, n int) []byte {
+	if len(b) < n {
+		return b
+	}
+	return b[:n]
+}
+
 func (d *Device) GetAttendanceLogs(
 	from *time.Time,
 	to *time.Time,
@@ -343,6 +443,14 @@ func (d *Device) GetAttendanceLogs(
 	// re-enable afterwards (best effort).
 	_, _ = d.sess.exchange(cmdDisableDevice, nil, 8)
 
+	// The device's own record count decides the record grid (pyzk
+	// read_sizes -> records). Without it the grid would have to be guessed,
+	// and a wrong grid silently mis-aligns timestamps.
+	deviceRecords, sizeErr := d.sess.readRecords()
+	if sizeErr != nil {
+		log.Printf("[zkteco] CMD_GET_FREE_SIZES unavailable, falling back to payload heuristics: %v", sizeErr)
+	}
+
 	blob, err := d.sess.readChunked(cmdAttLogRRQ, nil)
 
 	_, _ = d.sess.exchange(cmdEnableDevice, nil, 8)
@@ -351,7 +459,23 @@ func (d *Device) GetAttendanceLogs(
 		return nil, fmt.Errorf("failed to get attendance logs: %w", err)
 	}
 
-	logs := parseLogs(blob)
+	logs, g := parseLogs(blob, deviceRecords)
+
+	log.Printf(
+		"[zkteco] att blob: len=%d framed=%t total_size=%d device_records=%d grid=%d parsed=%d head=%x",
+		len(blob), g.Framed, g.TotalSize, g.DeviceRecords, g.RecordSize, len(logs), headBytes(blob, 48),
+	)
+
+	// The one check that catches a mis-aligned grid: the device states how
+	// many records it holds, so a different parse count means the fields
+	// (including timestamps) are being read at the wrong offsets.
+	if g.Mismatch {
+		log.Printf(
+			"[zkteco] WARNING parsed %d records but the device reports %d (grid=%d) — "+
+				"timestamps/user ids from this payload are suspect",
+			len(logs), g.DeviceRecords, g.RecordSize,
+		)
+	}
 
 	records := make([]types.AttendanceRecord, 0, len(logs))
 

@@ -48,6 +48,14 @@ func (d *Device) ProbeTCP() (int64, error) {
 	return 0, fmt.Errorf("hikvision not implemented")
 }
 
+func (d *Device) GetDeviceTime() (time.Time, error) {
+	return time.Time{}, fmt.Errorf("hikvision not implemented")
+}
+
+func (d *Device) SetDeviceTime(t time.Time) error {
+	return fmt.Errorf("hikvision not implemented")
+}
+
 func (d *Device) Diagnose() types.Diagnosis {
 	var diag types.Diagnosis
 	diag.Handshake.OK = false

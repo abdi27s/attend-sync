@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	readBufSize     = 8192
-	connectRespSize = 1032 // pyzk reads response_size+8 on TCP connect
-	commKeyTicks    = 50
+	readBufSize       = 8192
+	connectRespSize   = 1032 // pyzk reads response_size+8 on TCP connect
+	commKeyTicks      = 50
+	freeSizesRespSize = 1024 // pyzk read_sizes: response_size = 1024
+	freeSizesFields   = 20   // pyzk: unpack('20i', data[:80])
 )
 
 // rawSession is a single TCP connection to the device with pyzk framing.
@@ -163,6 +165,35 @@ func (s *rawSession) close() {
 	s.connected = false
 }
 
+// readRecords returns how many attendance records the device says it holds
+// (CMD_GET_FREE_SIZES, pyzk read_sizes -> fields[8] of '20i' over 80 bytes).
+//
+// This is THE authoritative record grid input: pyzk computes
+// record_size = total_size / records, and without it the grid must be
+// guessed, which mis-aligns timestamps when two candidate sizes both divide
+// the payload (e.g. 5 x 16-byte records = 80 bytes, which 40 divides too).
+func (s *rawSession) readRecords() (int, error) {
+	resp, err := s.exchange(cmdGetFreeSizes, nil, freeSizesRespSize)
+	if err != nil {
+		return 0, fmt.Errorf("CMD_GET_FREE_SIZES: %w", err)
+	}
+	if resp.cmd != cmdAckOK && resp.cmd != cmdAckData {
+		return 0, fmt.Errorf("CMD_GET_FREE_SIZES rejected: code %d", resp.cmd)
+	}
+	if len(resp.data) < freeSizesFields*4 {
+		return 0, fmt.Errorf(
+			"short CMD_GET_FREE_SIZES reply: %d bytes (need %d)",
+			len(resp.data), freeSizesFields*4,
+		)
+	}
+
+	records := int(int32(binary.LittleEndian.Uint32(resp.data[8*4 : 9*4])))
+	if records < 0 {
+		return 0, fmt.Errorf("CMD_GET_FREE_SIZES reported a negative record count: %d", records)
+	}
+	return records, nil
+}
+
 // readChunked fetches bulk attendance/user data the pyzk way:
 //
 //	get_attendance -> read_with_buffer(CMD_ATTLOG_RRQ):
@@ -192,11 +223,14 @@ func (s *rawSession) readChunked(cmd uint16, payload []byte) ([]byte, error) {
 	if size <= 4 {
 		return nil, nil
 	}
-	out := make([]byte, 0, size)
-	if len(resp.data) > 4 {
-		out = append(out, resp.data[4:]...)
-	}
-	for len(out) < size {
+	// Keep the payload framed EXACTLY as the device sent it — leading
+	// total_size u32 included. pyzk's get_attendance consumes that layout
+	// (unpack "I" at [0:4], then records at [4:]), and parseLogs detects the
+	// same prefix. Stripping it here would hand the parser bare records and
+	// force it to guess the grid again.
+	want := size + 4
+	out := append([]byte(nil), resp.data...)
+	for len(out) < want {
 		r, err := s.exchange(cmdData, nil, 1032)
 		if err != nil {
 			return nil, fmt.Errorf("data chunk: %w", err)
@@ -205,13 +239,10 @@ func (s *rawSession) readChunked(cmd uint16, payload []byte) ([]byte, error) {
 			break
 		}
 		out = append(out, r.data...)
-		if len(out) >= size {
-			break
-		}
 	}
 	_, _ = s.exchange(cmdFreeData, nil, 8)
-	if len(out) > size {
-		out = out[:size]
+	if len(out) > want {
+		out = out[:want]
 	}
 	return out, nil
 }

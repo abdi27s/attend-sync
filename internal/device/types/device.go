@@ -53,6 +53,14 @@ type AttendanceDevice interface {
 
 	GetDeviceInfo() (DeviceInfo, error)
 
+	// GetDeviceTime reads the device's own RTC (ZKTeco CMD_GET_TIME). Every
+	// attendance timestamp is produced by this clock, so an unset RTC
+	// (dead battery) shows up here as year 2000.
+	GetDeviceTime() (time.Time, error)
+	// SetDeviceTime writes the device RTC (ZKTeco CMD_SET_TIME) so that
+	// subsequent punches are stamped with the current date/time.
+	SetDeviceTime(t time.Time) error
+
 	GetAttendanceLogs(
 		from *time.Time,
 		to *time.Time,

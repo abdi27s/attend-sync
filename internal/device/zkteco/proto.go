@@ -38,10 +38,16 @@ const (
 	cmdFreeData    uint16 = 1502
 
 	cmdGetTime    uint16 = 201
+	cmdSetTime    uint16 = 202
 	cmdOptionsRRQ uint16 = 11
 	cmdAttLogRRQ  uint16 = 13
 	cmdGetVersion uint16 = 1100
 	cmdAuth       uint16 = 1102
+
+	// cmdGetFreeSizes is CMD_GET_FREE_SIZES (pyzk read_sizes). Its 80-byte
+	// reply carries the device's own counters, including the stored
+	// attendance record count — which is what fixes the record grid.
+	cmdGetFreeSizes uint16 = 50
 )
 
 // checksum implements the ZKTeco checksum verbatim (zkemsdk.c / pyzk).
@@ -89,10 +95,16 @@ func buildPacket(command uint16, payload []byte, sessionID, replyID uint16) (raw
 	chkBuf = append(chkBuf, payload...)
 	sum := checksum(chkBuf)
 
-	nextReply = replyID + 1
-	if nextReply >= uShortMax {
-		nextReply -= uShortMax
+	// pyzk: reply_id += 1; if reply_id >= USHRT_MAX: reply_id -= USHRT_MAX.
+	// The wrap MUST be done in wider-than-uint16 arithmetic: in uint16
+	// terms 65535+1 wraps to 0, but pyzk/zkemsdk yield 1 (65536-65535). A
+	// reply id that disagrees with the device's expectation makes the
+	// device drop the session mid-fetch. Locked down by proto_test.go.
+	next := uint32(replyID) + 1
+	if next >= uint32(uShortMax) {
+		next -= uint32(uShortMax)
 	}
+	nextReply = uint16(next)
 	binary.LittleEndian.PutUint16(head[0:2], command)
 	binary.LittleEndian.PutUint16(head[2:4], sum)
 	binary.LittleEndian.PutUint16(head[4:6], sessionID)

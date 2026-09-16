@@ -19,6 +19,12 @@ type Device interface {
 
 	GetDeviceInfo() (types.DeviceInfo, error)
 
+	// GetDeviceTime reads the device RTC; SetDeviceTime sets it. Attendance
+	// timestamps come from this clock, so it is the first thing to check
+	// when records look like year 2000.
+	GetDeviceTime() (time.Time, error)
+	SetDeviceTime(t time.Time) error
+
 	GetAttendanceLogs(
 		from *time.Time,
 		to *time.Time,

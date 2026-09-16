@@ -63,16 +63,16 @@ func (h *Handler) Attendance(
 	defer cancel()
 
 	type result struct {
-		logs []attendance.AttendanceLog
-		err  error
+		fetch attendance.FetchResult
+		err   error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		l, err := h.attendanceService.FetchLogs(config, req.From, req.To)
-		ch <- result{logs: l, err: err}
+		f, err := h.attendanceService.FetchLogsWithClock(config, req.From, req.To)
+		ch <- result{fetch: f, err: err}
 	}()
 
-	var logs []attendance.AttendanceLog
+	var fetch attendance.FetchResult
 	select {
 	case <-ctx.Done():
 		log.Printf("[api] attendance fetch for device %q timed out: %v", config.ID, ctx.Err())
@@ -90,11 +90,16 @@ func (h *Handler) Attendance(
 			})
 			return
 		}
-		logs = res.logs
+		fetch = res.fetch
 	}
 
+	logs := fetch.Logs
 	if logs == nil {
 		logs = []attendance.AttendanceLog{}
+	}
+
+	if fetch.Warning != "" {
+		log.Printf("[api] attendance device=%q warning: %s", config.ID, fetch.Warning)
 	}
 
 	response := AttendanceResponse{
@@ -108,6 +113,12 @@ func (h *Handler) Attendance(
 		},
 		Count:   len(logs),
 		Records: logs,
+		Warning: fetch.Warning,
+	}
+
+	if fetch.Clock != nil {
+		clock := newClockResponse(*fetch.Clock)
+		response.Clock = &clock
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -253,6 +264,150 @@ func (h *Handler) DiagnoseDevice(
 		TCP:       TCPProbeResult{OK: diag.TCP.OK, LatencyMs: diag.TCP.LatencyMs, Error: diag.TCP.Error},
 		Handshake: HandshakeResult{OK: diag.Handshake.OK, Error: diag.Handshake.Error},
 		Hints:     diag.Hints,
+	})
+}
+
+// decodeDeviceTestRequest decodes and validates the {"device": {...}} body
+// shared by all device endpoints. It writes the error response itself and
+// reports false when the caller should stop.
+func decodeDeviceTestRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+) (DeviceTestRequest, bool) {
+	var req DeviceTestRequest
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   "invalid JSON: " + err.Error(),
+		})
+		return req, false
+	}
+
+	if err := validateDeviceRequest(req.Device); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return req, false
+	}
+
+	return req, true
+}
+
+// DeviceClock reads the device RTC — the clock that stamps every attendance
+// record. Year 2000 timestamps come from an unset device clock, not from the
+// parser, and this endpoint is how you see that.
+func (h *Handler) DeviceClock(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Success: false,
+			Error:   "method not allowed",
+		})
+		return
+	}
+
+	req, ok := decodeDeviceTestRequest(w, r)
+	if !ok {
+		return
+	}
+
+	config := toDeviceConfig(req.Device)
+
+	clock, err := h.attendanceService.DeviceClock(config)
+	if err != nil {
+		log.Printf("[api] clock read failed device=%q host=%s: %v", config.ID, config.Host, err)
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "failed to read device clock: " + err.Error(),
+		})
+		return
+	}
+
+	log.Printf(
+		"[api] clock device=%q device_time=%s drift=%ds in_sync=%t",
+		config.ID, clock.DeviceTime.Format(time.RFC3339), clock.DriftSeconds, clock.InSync,
+	)
+
+	writeJSON(w, http.StatusOK, struct {
+		Success bool           `json:"success"`
+		Device  DeviceResponse `json:"device"`
+		Clock   ClockResponse  `json:"clock"`
+	}{
+		Success: true,
+		Device: DeviceResponse{
+			ID:   req.Device.ID,
+			Name: req.Device.Name,
+			Type: req.Device.Type,
+			Host: req.Device.Host,
+			Port: config.NormalizedPort(),
+		},
+		Clock: newClockResponse(clock),
+	})
+}
+
+// SyncDeviceClock writes the server clock into the device (CMD_SET_TIME) so
+// that future punches carry the correct date and time, then reads it back to
+// confirm. Already-stored records are NOT rewritten: a log stamped 2000 was
+// stored with the scalar 0 and the real instant is unrecoverable.
+func (h *Handler) SyncDeviceClock(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Success: false,
+			Error:   "method not allowed",
+		})
+		return
+	}
+
+	req, ok := decodeDeviceTestRequest(w, r)
+	if !ok {
+		return
+	}
+
+	config := toDeviceConfig(req.Device)
+
+	clock, err := h.attendanceService.SyncClock(config)
+	if err != nil {
+		log.Printf("[api] clock sync failed device=%q host=%s: %v", config.ID, config.Host, err)
+		writeJSON(w, http.StatusBadGateway, ErrorResponse{
+			Success: false,
+			Error:   "failed to set device clock: " + err.Error(),
+		})
+		return
+	}
+
+	log.Printf(
+		"[api] clock sync device=%q device_time=%s drift=%ds applied=%t",
+		config.ID, clock.DeviceTime.Format(time.RFC3339), clock.DriftSeconds, clock.InSync,
+	)
+
+	message := "device clock set to server time; new punches will be stamped correctly. " +
+		"Records already stored with the old clock keep their original timestamps."
+	if !clock.InSync {
+		message = "device accepted the write but still reports a different time; " + clock.Warning
+	}
+
+	writeJSON(w, http.StatusOK, ClockSyncResponse{
+		Success: true,
+		Device: DeviceResponse{
+			ID:   req.Device.ID,
+			Name: req.Device.Name,
+			Type: req.Device.Type,
+			Host: req.Device.Host,
+			Port: config.NormalizedPort(),
+		},
+		Clock:   newClockResponse(clock),
+		Applied: clock.InSync,
+		Message: message,
 	})
 }
 
