@@ -95,8 +95,9 @@ func (s *rawSession) exchange(cmd uint16, payload []byte, respSize int) (*rawRes
 	return &rawResp{cmd: c, sess: sess, reply: reply, data: data}, nil
 }
 
-// readFrame reads TCP-TOP(8) + declared length, like pyzk's
-// __send_command TCP branch (recv(response_size+8), check magic).
+// readFrame reads one full TCP frame: TCP-TOP(8) + inner_len bytes.
+// pyzk does a single recv(response_size+8) per command; we loop until the
+// declared length arrives (same bytes, robust to TCP segmentation).
 func (s *rawSession) readFrame(respSize int) ([]byte, error) {
 	if err := s.conn.SetReadDeadline(time.Now().Add(s.timeout)); err != nil {
 		return nil, err

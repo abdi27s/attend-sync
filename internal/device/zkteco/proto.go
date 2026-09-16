@@ -2,10 +2,13 @@ package zkteco
 
 // Raw ZKTeco wire protocol (pyzk-compatible).
 //
-// Why this file exists: go-zkteco v0.1.0 builds a malformed TCP frame.
-// It sends PP PP len zeros CMD ... but the device expects the pyzk
-// framing: TCP-TOP(8: 0x5050 0x7282 len) + HEADER(8) + payload.
-// The device therefore RSTs every handshake right after TCP open.
+// Framing (pyzk zk/base.py: __create_tcp_top + __create_header):
+//
+//	TCP-TOP(8: u16 0x5050, u16 0x7D82, u32 inner_len) +
+//	HEADER(8: u16 cmd, u16 checksum, u16 session, u16 reply+1) + payload
+//
+// Checksum (zkemsdk.c / pyzk __create_checksum): 16-bit LE word sum with
+// the fold subtracting USHRT_MAX (65535), NOT 65536 — intentional.
 
 import (
 	"encoding/binary"
@@ -16,7 +19,7 @@ const (
 	uShortMax = 65535
 
 	tcpMagic1 = 0x5050
-	tcpMagic2 = 0x7282
+	tcpMagic2 = 0x7D82
 
 	cmdConnect       uint16 = 1000
 	cmdExit          uint16 = 1001
@@ -49,6 +52,8 @@ func checksum(p []byte) uint16 {
 	var sum uint32
 	i := 0
 	for l > 1 {
+		// pyzk: unpack('H', pack('BB', p[0], p[1])) — native order,
+		// little-endian on x86/ARM. Match with explicit LE read.
 		sum += uint32(binary.LittleEndian.Uint16(p[i : i+2]))
 		i += 2
 		if sum > uShortMax {

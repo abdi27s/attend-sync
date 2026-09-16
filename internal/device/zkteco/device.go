@@ -25,11 +25,8 @@ const (
 type Device struct {
 	config types.DeviceConfig
 	sess   *rawSession
-	// client is kept only so old serialized state / stale callers do not
-	// break; the raw pyzk-compatible session above is now authoritative.
-	client any
-	// lastProbe records the outcome of the pre-connect TCP probe so
-	// Connect() can return actionable errors.
+	// lastProbe records the last handshake outcome for error context.
+	// (No separate TCP probe is done on Connect — see note there.)
 	lastProbe string
 }
 
@@ -62,16 +59,13 @@ func (d *Device) Connect() error {
 		d.sess.close()
 		d.sess = nil
 	}
-	// Drop any legacy library handle (no longer used, kept for compat).
-	d.client = nil
 
 	address := d.address()
 
-	// Step 1: bare TCP probe BEFORE the handshake (network vs protocol).
-	if err := d.probeTCP(address); err != nil {
-		return err
-	}
-
+	// NOTE: no bare-TCP probe here. The device allows ONE session and our
+	// own probe was occupying it: probe dial -> device allocates slot ->
+	// probe closes without CMD_EXIT -> stale slot -> real CMD_CONNECT gets
+	// RST. Single connection, straight to handshake (like pyzk).
 	commKey, err := parseCommKey(d.config.Password)
 	if err != nil {
 		return fmt.Errorf("device at %s: %w", address, err)
@@ -110,13 +104,13 @@ func (d *Device) Disconnect() error {
 		d.sess.close()
 		d.sess = nil
 	}
-	d.client = nil
 	return nil
 }
 
 // probeTCP opens and immediately closes a bare TCP connection.
-// It proves L3/L4 reachability without speaking the ZKTeco protocol,
-// so a later RST can be attributed to the device session layer.
+// WARNING: the device allows ONE session, so this probe itself can occupy
+// or disturb the session table. Connect() no longer calls it — it is kept
+// only for Diagnose()/ProbeTCP() on explicit user request.
 func (d *Device) probeTCP(address string) error {
 	conn, err := net.DialTimeout("tcp", address, tcpDialTimeout)
 	if err != nil {
@@ -163,8 +157,9 @@ func (d *Device) diagnose(err error) error {
 	switch {
 	case isReset(err):
 		return fmt.Errorf(
-			"%w — device reset the session after TCP open (probe=%q). "+
-				"Device allows ONE session: close ZKBio/other tools, power-cycle, wait 30s, retry once",
+			"%w (probe=%q). "+
+				"Device RST the handshake: single-session busy (close ZKBio/other tools, "+
+				"power-cycle, wait 30s, retry ONCE), or comm key / TCP-mode mismatch",
 			err, d.lastProbe,
 		)
 	case isUnauthErr(err):
@@ -174,8 +169,7 @@ func (d *Device) diagnose(err error) error {
 		)
 	case isTimeoutErr(err):
 		return fmt.Errorf(
-			"%w — device stopped answering mid-handshake (probe=%q). "+
-				"Likely overloaded device; power-cycle and retry",
+			"%w (probe=%q). Device stopped answering mid-handshake; power-cycle and retry",
 			err, d.lastProbe,
 		)
 	default:
