@@ -191,6 +191,71 @@ func (h *Handler) TestDevice(
 	})
 }
 
+func (h *Handler) DiagnoseDevice(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{
+			Success: false,
+			Error:   "method not allowed",
+		})
+		return
+	}
+
+	var req DeviceTestRequest
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   "invalid JSON: " + err.Error(),
+		})
+		return
+	}
+
+	if err := validateDeviceRequest(req.Device); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	config := toDeviceConfig(req.Device)
+	deviceResp := DeviceResponse{
+		ID:   req.Device.ID,
+		Name: req.Device.Name,
+		Type: req.Device.Type,
+		Host: req.Device.Host,
+		Port: config.NormalizedPort(),
+	}
+
+	diag, err := h.attendanceService.Diagnose(config)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	status := http.StatusOK
+	if !diag.TCP.OK || !diag.Handshake.OK {
+		status = http.StatusBadGateway
+	}
+
+	writeJSON(w, status, DeviceDiagnoseResponse{
+		Success:   diag.TCP.OK && diag.Handshake.OK,
+		Device:    deviceResp,
+		TCP:       TCPProbeResult{OK: diag.TCP.OK, LatencyMs: diag.TCP.LatencyMs, Error: diag.TCP.Error},
+		Handshake: HandshakeResult{OK: diag.Handshake.OK, Error: diag.Handshake.Error},
+		Hints:     diag.Hints,
+	})
+}
+
 func (h *Handler) DeviceInfo(
 	w http.ResponseWriter,
 	r *http.Request,

@@ -1,6 +1,7 @@
 package hikvision
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/abdi27s/attend-sync/internal/device/types"
@@ -41,4 +42,16 @@ func (d *Device) GetAttendanceLogs(
 	to *time.Time,
 ) ([]types.AttendanceRecord, error) {
 	return nil, nil
+}
+
+func (d *Device) ProbeTCP() (int64, error) {
+	return 0, fmt.Errorf("hikvision not implemented")
+}
+
+func (d *Device) Diagnose() types.Diagnosis {
+	var diag types.Diagnosis
+	diag.Handshake.OK = false
+	diag.Handshake.Error = "hikvision not implemented"
+	diag.Hints = []string{"only zkteco is supported"}
+	return diag
 }

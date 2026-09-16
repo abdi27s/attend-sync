@@ -15,7 +15,8 @@ func New(config types.DeviceConfig) (Device, error) {
 
 	switch strings.ToLower(strings.TrimSpace(config.Type)) {
 	case "zkteco":
-		return zkteco.New(config), nil
+		d := zkteco.New(config)
+		return d, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported device type: %q (supported: zkteco)", config.Type)

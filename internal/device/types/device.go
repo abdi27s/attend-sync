@@ -45,11 +45,31 @@ type AttendanceDevice interface {
 	Disconnect() error
 	TestConnection() error
 
+	// ProbeTCP performs a bare TCP dial (no ZKTeco protocol) and reports
+	// latency in milliseconds.
+	ProbeTCP() (latencyMs int64, err error)
+	// Diagnose runs TCP probe + handshake and returns structured hints.
+	Diagnose() Diagnosis
+
 	GetDeviceInfo() (DeviceInfo, error)
 
 	GetAttendanceLogs(
 		from *time.Time,
 		to *time.Time,
 	) ([]AttendanceRecord, error)
+}
+
+// Diagnosis is the structured result of Diagnose().
+type Diagnosis struct {
+	TCP struct {
+		OK        bool
+		LatencyMs int64
+		Error     string
+	}
+	Handshake struct {
+		OK    bool
+		Error string
+	}
+	Hints []string
 }
 

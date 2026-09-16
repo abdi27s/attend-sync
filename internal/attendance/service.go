@@ -19,9 +19,6 @@ func (s *Service) FetchLogs(
 	from *time.Time,
 	to *time.Time,
 ) ([]AttendanceLog, error) {
-	if config.Host == "" {
-		return nil, fmt.Errorf("device host is required")
-	}
 
 	attendanceDevice, err := device.New(config)
 	if err != nil {
@@ -58,4 +55,13 @@ func (s *Service) FetchLogs(
 	}
 
 	return logs, nil
+}
+
+// Diagnose runs TCP probe + handshake without fetching logs.
+func (s *Service) Diagnose(config types.DeviceConfig) (types.Diagnosis, error) {
+	attendanceDevice, err := device.New(config)
+	if err != nil {
+		return types.Diagnosis{}, err
+	}
+	return attendanceDevice.Diagnose(), nil
 }
