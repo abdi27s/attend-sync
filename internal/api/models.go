@@ -53,17 +53,17 @@ type DeviceTestResponse struct {
 }
 
 type DeviceDiagnoseResponse struct {
-	Success   bool           `json:"success"`
-	Device    DeviceResponse `json:"device"`
-	TCP       TCPProbeResult `json:"tcp"`
+	Success   bool            `json:"success"`
+	Device    DeviceResponse  `json:"device"`
+	TCP       TCPProbeResult  `json:"tcp"`
 	Handshake HandshakeResult `json:"handshake"`
-	Hints     []string       `json:"hints"`
+	Hints     []string        `json:"hints"`
 }
 
 type TCPProbeResult struct {
-	OK       bool   `json:"ok"`
+	OK        bool   `json:"ok"`
 	LatencyMs int64  `json:"latency_ms"`
-	Error    string `json:"error,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type HandshakeResult struct {
